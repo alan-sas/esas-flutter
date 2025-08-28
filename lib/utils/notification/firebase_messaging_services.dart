@@ -1,18 +1,19 @@
+import 'dart:io';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
+import 'package:get/get.dart';
+
+import '../../utils/notification/notification_services.dart';
 import 'package:esas/app/routes/app_pages.dart';
 import 'package:esas/app/services/api_provider.dart';
 import 'package:esas/app/widgets/views/snackbar.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/foundation.dart'; // Untuk debugPrint
-import 'package:get/get.dart';
-
-import '../../utils/notification/notification_services.dart'; // Sesuaikan path jika berbeda
 
 // --- Global Background Message Handler ---
-// Penting: Fungsi ini HARUS tetap di level teratas (di luar class manapun).
-// Firebase memanggilnya dalam isolat Dart terpisah ketika aplikasi di-background/terminated.
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // Pastikan Firebase diinisialisasi untuk background handler
   await Firebase.initializeApp();
   debugPrint("Background message: ${message.messageId}");
   debugPrint("Data: ${message.data}");
@@ -29,72 +30,85 @@ class FirebaseMessagingService extends GetxService {
   late final NotificationService _notificationService;
   final ApiProvider _apiProvider = Get.find<ApiProvider>();
 
-  // RxString untuk menyimpan token FCM (opsional, jika ingin ditampilkan di UI)
   final RxString _fcmToken = ''.obs;
   String get fcmToken => _fcmToken.value;
 
   @override
   void onInit() {
     super.onInit();
-    // Temukan instance NotificationService yang sudah terdaftar
     _notificationService = Get.find<NotificationService>();
-
-    // Panggil inisialisasi listener Firebase Messaging
     _initializeFirebaseMessagingListeners();
   }
 
-  /// Menginisialisasi semua listener Firebase Messaging (permissions, token, foreground, background, opened app, initial message).
+  /// Menginisialisasi semua listener Firebase Messaging.
   Future<void> _initializeFirebaseMessagingListeners() async {
-    // 1. Meminta izin notifikasi dari pengguna.
+    try {
+      // 1. Meminta izin notifikasi dari pengguna
+      await _requestPermissions();
+
+      // 2. Pada iOS, ambil token APNS terlebih dahulu
+      // Ini adalah langkah KRUSIAL untuk menghindari error "APNS token not set"
+      if (Platform.isIOS) {
+        String? apnsToken = await _firebaseMessaging.getAPNSToken();
+        if (apnsToken == null) {
+          debugPrint("Warning: APNS token is not yet available.");
+        } else {
+          debugPrint("APNS Token: $apnsToken");
+        }
+      }
+
+      // 3. Mengambil dan mencetak token FCM
+      await _getAndSetupFCMToken();
+
+      // 4. Mengatur handler untuk berbagai skenario
+      _setupMessageHandlers();
+    } catch (e) {
+      debugPrint("Error initializing Firebase Messaging: $e");
+    }
+  }
+
+  /// Meminta izin notifikasi dari pengguna.
+  Future<void> _requestPermissions() async {
     final settings = await _firebaseMessaging.requestPermission(
       alert: true,
       badge: true,
       sound: true,
-      // Tambahkan kembali criticalAlert, provisional, dll. jika diperlukan
-      announcement: false,
-      carPlay: false,
-      criticalAlert: false,
-      provisional: false,
     );
-
-    switch (settings.authorizationStatus) {
-      case AuthorizationStatus.authorized:
-        debugPrint('Notification permission granted.');
-        break;
-      case AuthorizationStatus.provisional:
-        debugPrint('Provisional notification permission granted.');
-        break;
-      default:
-        debugPrint('Notification permission denied.');
+    if (settings.authorizationStatus == AuthorizationStatus.authorized) {
+      debugPrint('Notification permission granted.');
+    } else {
+      debugPrint('Notification permission denied or provisional.');
     }
+  }
 
-    // 2. Mengambil dan mencetak token FCM saat ini.
+  /// Mengambil token FCM dan mengirimkannya ke server.
+  Future<void> _getAndSetupFCMToken() async {
     final token = await _firebaseMessaging.getToken();
     if (token != null) {
       debugPrint("FCM Token: $token");
-      _fcmToken.value = token; // Simpan token ke RxString
-      setupToken(_fcmToken.value);
+      _fcmToken.value = token;
+      await setupToken(_fcmToken.value);
     } else {
       debugPrint("Unable to get FCM Token.");
       _fcmToken.value = '';
     }
 
-    // 3. Menangani event FCM Token Refresh.
+    // Mendengarkan saat token diperbarui
     _firebaseMessaging.onTokenRefresh.listen(
-      (newToken) {
+      (newToken) async {
         debugPrint("FCM Token Refreshed: $newToken");
-        _fcmToken.value = newToken; // Update token ke RxString
-        setupToken(_fcmToken.value);
+        _fcmToken.value = newToken;
+        await setupToken(newToken);
       },
       onError: (err) {
         debugPrint("FCM Token Refresh Error: $err");
       },
     );
+  }
 
-    // 4. Mengatur handler pesan background global.
-    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-
-    // 5. Menangani Pesan Foreground.
+  /// Mengatur semua listener pesan (foreground, background, opened app).
+  void _setupMessageHandlers() {
+    // Handler untuk pesan di foreground
     FirebaseMessaging.onMessage.listen((message) {
       debugPrint("Foreground message: ${message.data}");
       _notificationService.showNotification(
@@ -103,48 +117,31 @@ class FirebaseMessagingService extends GetxService {
       );
     });
 
-    // 6. Menangani Pesan saat aplikasi dibuka dari keadaan terminated/background.
+    // Handler untuk pesan saat aplikasi dibuka dari terminated/background
     FirebaseMessaging.onMessageOpenedApp.listen((message) {
       debugPrint('Notification opened app. Data: ${message.data}');
       _handleNotificationNavigation(message.data);
     });
 
-    // 7. Mengambil pesan awal jika aplikasi diluncurkan dari keadaan terminated oleh notifikasi.
-    final initialMessage = await _firebaseMessaging.getInitialMessage();
-    if (initialMessage != null) {
-      debugPrint("Initial message opened app: ${initialMessage.data}");
-      _handleNotificationNavigation(initialMessage.data);
-    }
+    // Mengambil pesan awal jika aplikasi diluncurkan dari terminated oleh notifikasi
+    _firebaseMessaging.getInitialMessage().then((initialMessage) {
+      if (initialMessage != null) {
+        debugPrint("Initial message opened app: ${initialMessage.data}");
+        _handleNotificationNavigation(initialMessage.data);
+      }
+    });
+
+    // Mengatur handler pesan background global
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
   }
 
   /// Helper method untuk menangani navigasi berdasarkan data notifikasi.
-  /// Ini bisa diperluas untuk mem-parsing kunci spesifik dari data.
   void _handleNotificationNavigation(Map<String, dynamic> data) {
-    // Contoh: Navigasi ke halaman NOTIFICATION, Anda bisa menambahkan argumen jika diperlukan
-    Get.toNamed(Routes.NOTIFICATION, arguments: data);
-
-    // Contoh logika navigasi yang lebih kompleks:
-    // if (data.containsKey('route_name')) {
-    //   Get.toNamed(data['route_name'], arguments: data);
-    // } else if (data.containsKey('product_id')) {
-    //   Get.toNamed(Routes.PRODUCT_DETAIL, arguments: data['product_id']);
-    // }
-  }
-
-  // Metode opsional untuk mengambil token FCM saat ini dari luar service
-  Future<String?> getFCMToken() async {
-    return await _firebaseMessaging.getToken();
-  }
-
-  // Metode opsional untuk subscribe/unsubscribe ke topik
-  Future<void> subscribeToTopic(String topic) async {
-    await _firebaseMessaging.subscribeToTopic(topic);
-    debugPrint('Subscribed to topic: $topic');
-  }
-
-  Future<void> unsubscribeFromTopic(String topic) async {
-    await _firebaseMessaging.unsubscribeFromTopic(topic);
-    debugPrint('Unsubscribed from topic: $topic');
+    if (data.containsKey('route')) {
+      Get.toNamed(data['route'] as String, arguments: data);
+    } else {
+      Get.toNamed(Routes.NOTIFICATION, arguments: data);
+    }
   }
 
   Future<void> setupToken(String token) async {
